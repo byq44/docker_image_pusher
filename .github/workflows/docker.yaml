@@ -78,7 +78,7 @@ jobs:
             --access-key-secret $ALIYUN_SK \
             --region "$ALIYUN_REGION"
 
-      - name: Sync Images
+            - name: Sync Images
         run: |
           # 安全登录镜像仓库
           echo "$ALIYUN_REGISTRY_PASSWORD" | docker login "$ALIYUN_REGISTRY" -u "$ALIYUN_REGISTRY_USER" --password-stdin
@@ -110,10 +110,12 @@ jobs:
               img_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
               img_tag=$(echo "$image_name_tag" | awk -F':' '{print $2}')
 
-              # 空命名空间直接留空，不再用占位符，彻底根除__EMPTY__
+              # 空命名空间用占位符，保证数组下标不为空
               local repo_prefix=""
               if [[ -n "$name_space" ]]; then
                 repo_prefix="${name_space}_"
+              else
+                repo_prefix="__EMPTY__"
               fi
               # platform前缀
               local plat_prefix=""
@@ -124,12 +126,12 @@ jobs:
               echo "$plat_prefix $repo_prefix $img_name $img_tag"
           }
 
-          # 【工具函数2】查询镜像是否存在（优化返回码逻辑，仓库不存在直接返回不存在）
+          # 【工具函数2】双层校验：先查仓库，再查Tag
           function check_aliyun_image_exist() {
               local repo_name=$1
               local tag=$2
               set +e
-              # 先查询仓库是否存在，仓库不存在直接返回1（不存在）
+              # 先判断仓库是否存在
               repo_check=$(timeout 10 aliyun cr ListRepo \
                   --Namespace "$ALIYUN_NAME_SPACE" \
                   --RepoName "$repo_name" 2>/dev/null)
@@ -137,7 +139,7 @@ jobs:
                 set -e
                 return 1
               fi
-              # 仓库存在再查tag列表
+              # 仓库存在再查标签
               local tag_list=$(timeout 10 aliyun cr ListRepoTag \
                   --Namespace "$ALIYUN_NAME_SPACE" \
                   --RepoName "$repo_name" \
@@ -148,7 +150,7 @@ jobs:
               return $ret
           }
 
-          # 预处理：识别重名镜像
+          # 预处理：识别重名镜像（下标永远不为空）
           declare -A duplicate_images
           declare -A temp_map
           while IFS= read -r line || [ -n "$line" ]; do
@@ -175,14 +177,16 @@ jobs:
                   continue
               fi
 
-              # 统一解析镜像（无__EMPTY__占位符，repo_prefix空就是空）
               read plat_prefix repo_prefix img_name img_tag <<< $(parse_image_line "$line")
-              target_full_name="${plat_prefix}${repo_prefix}${img_name}:${img_tag}"
-              target_repo="${plat_prefix}${repo_prefix}${img_name}"
+              # 占位符替换为空，用于真实API查询与日志展示
+              real_repo_prefix="$repo_prefix"
+              if [[ "$real_repo_prefix" == "__EMPTY__" ]]; then
+                real_repo_prefix=""
+              fi
+              target_full_name="${plat_prefix}${real_repo_prefix}${img_name}:${img_tag}"
+              target_repo="${plat_prefix}${real_repo_prefix}${img_name}"
 
-              # 打印调试信息，方便核对真实查询仓库名
-              echo "DEBUG: 待查询仓库名: $target_repo , Tag: $img_tag"
-              # 判断镜像是否已存在阿里云
+              echo "DEBUG 查询仓库: $target_repo  Tag: $img_tag"
               if check_aliyun_image_exist "$target_repo" "$img_tag"; then
                   echo "=============================="
                   echo "镜像 $ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$target_full_name 已存在，跳过同步"
@@ -192,7 +196,6 @@ jobs:
 
               echo "===== 开始处理镜像：$line ====="
               set +e
-              # 拉取镜像
               docker pull $line
               pull_exit=$?
               if [ $pull_exit -ne 0 ]; then
@@ -201,12 +204,10 @@ jobs:
                   continue
               fi
 
-              # 打标签
               target_img="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$target_full_name"
               src_image=$(echo "$line" | awk '{print $NF}' | xargs)
               docker tag "$src_image" "$target_img"
 
-              # 推送镜像
               docker push "$target_img"
               push_exit=$?
               if [ $push_exit -ne 0 ]; then
@@ -218,7 +219,6 @@ jobs:
               set -e
 
               echo "✅ 镜像【$line】同步完成"
-              # 清理本地镜像
               echo "开始清理磁盘空间"
               echo "=============================================================================="
               df -hT
