@@ -82,18 +82,20 @@ jobs:
               local tag=$2
               echo "【DEBUG查询】仓库:$repo_name 待匹配Tag:$tag"
               set +e
-              # 先判断仓库是否存在
-              repo_data=$(timeout 10 aliyun cr ListRepo --Namespace "$ALIYUN_NAME_SPACE" --RepoName "$repo_name" 2>/dev/null)
-              if [[ -z "$repo_data" ]]; then
-                echo "【DEBUG】仓库不存在，镜像不存在"
-                set -e
-                return 1
-              fi
-              # 查询所有Tag
-              local tag_list=$(timeout 10 aliyun cr ListRepoTag \
+              local tag_output
+              # 2>&1 捕获标准错误，识别仓库不存在报错
+              tag_output=$(timeout 10 aliyun cr ListRepoTag \
                   --Namespace "$ALIYUN_NAME_SPACE" \
                   --RepoName "$repo_name" \
-                  --PageSize 100 2>/dev/null | jq -r '.Tags[].Tag')
+                  --PageSize 100 2>&1)
+              # 捕获仓库不存在报错
+              if echo "$tag_output" | grep -i "RepositoryNotFound" >/dev/null; then
+                  echo "【DEBUG】仓库不存在，镜像不存在"
+                  set -e
+                  return 1
+              fi
+              # 解析已有Tag列表
+              local tag_list=$(echo "$tag_output" | jq -r '.Tags[].Tag' 2>/dev/null)
               echo "【DEBUG】仓库现有Tag列表：$tag_list"
               echo "$tag_list" | grep -xF "$tag" >/dev/null
               local ret=$?
