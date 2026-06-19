@@ -52,27 +52,45 @@ jobs:
       - name: Docker Setup Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 安装阿里云CLI + jq，自动截取地域、实例ID
+      # ========== 缓存阿里云CLI二进制，避免重复下载 ==========
+      - name: Cache Aliyun CLI Binary
+        uses: actions/cache@v4
+        id: cache-aliyun-cli
+        with:
+          # 缓存二进制所在路径
+          path: /usr/local/bin/aliyun
+          # 缓存key，区分系统，固定版本则永久命中
+          key: ${{ runner.os }}-aliyun-cli-v3.3.23
+          restore-keys: |
+            ${{ runner.os }}-aliyun-cli-
+
+      # 安装阿里云CLI + jq，国内镜像解决404，缓存命中则跳过下载
       - name: Install Aliyun CLI & jq
+        if: steps.cache-aliyun-cli.outputs.cache-hit != 'true'
         run: |
           sudo apt update && sudo apt install -y jq
-          curl -fsSL https://aliyuncli.alicdn.com/aliyuncli-linux-latest-amd64.tgz | tar xz
+          # 国内镜像加速下载，不会404
+          curl -fsSL https://mirrors.aliyun.com/aliyuncli/aliyun-cli-linux-latest-amd64.tgz -o aliyun.tgz
+          tar -xzf aliyun.tgz
           sudo mv aliyun /usr/local/bin/
           aliyun --version || exit 1
 
+      # 配置阿里云CLI地域、实例ID（每次必须执行，配置存在内存，无需缓存）
+      - name: Config Aliyun CLI Env
+        run: |
           REGISTRY_FULL="$ALIYUN_REGISTRY"
-          # 截取实例ID（域名第一段 crpi-xxx）
-          INSTANCE_ID=$(echo "$REGISTRY_FULL" | awk -F'.' '{print $1}')
-          # 截取地域（域名第二段 cn-beijing）
-          ALIYUN_REGION=$(echo "$REGISTRY_FULL" | awk -F'.' '{print $2}')
-          echo "自动识别实例ID：$INSTANCE_ID"
-          echo "自动识别仓库地域：$ALIYUN_REGION"
+          # 自动截取实例ID（域名第一段 crpi-xxx）
+          echo "INSTANCE_ID=$(echo "$REGISTRY_FULL" | awk -F'.' '{print $1}')" >> $GITHUB_ENV
+          # 自动截取地域（域名第二段 cn-beijing）
+          echo "ALIYUN_REGION=$(echo "$REGISTRY_FULL" | awk -F'.' '{print $2}')" >> $GITHUB_ENV
+          echo "自动识别实例ID：${{ env.INSTANCE_ID }}"
+          echo "自动识别仓库地域：${{ env.ALIYUN_REGION }}"
 
           # 配置只读AK/SK
           aliyun configure set \
             --access-key-id $ALIYUN_AK \
             --access-key-secret $ALIYUN_SK \
-            --region "$ALIYUN_REGION"
+            --region "${{ env.ALIYUN_REGION }}"
 
       - name: Sync Images
         run: |
@@ -80,7 +98,7 @@ jobs:
           echo "$ALIYUN_REGISTRY_PASSWORD" | docker login "$ALIYUN_REGISTRY" -u "$ALIYUN_REGISTRY_USER" --password-stdin
 
           # 全局变量：实例ID、命名空间
-          INSTANCE_ID=$(echo "$ALIYUN_REGISTRY" | awk -F'.' '{print $1}')
+          INSTANCE_ID="${{ env.INSTANCE_ID }}"
           NAMESPACE="$ALIYUN_NAME_SPACE"
 
           # 函数：双层校验 仓库存在 + Tag版本存在
@@ -152,13 +170,13 @@ jobs:
               arr=($line)
               i=0
               while [[ $i -lt ${#arr[@]} ]]; do
-                if [[ "${arr[$i]}" == "--platform" ]]; then
-                  platform="${arr[$((i+1))]}"
-                  i=$((i+2))
-                else
-                  image_raw="${arr[$i]}"
-                  i=$((i+1))
-                fi
+                  if [[ "${arr[$i]}" == "--platform" ]]; then
+                      platform="${arr[$((i+1))]}"
+                      i=$((i+2))
+                  else
+                      image_raw="${arr[$i]}"
+                      i=$((i+1))
+                  fi
               done
 
               # 清理sha后缀
