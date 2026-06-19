@@ -80,12 +80,21 @@ jobs:
           function check_aliyun_image_exist() {
               local repo_name=$1
               local tag=$2
+              echo "【DEBUG查询】仓库:$repo_name 待匹配Tag:$tag"
               set +e
-              # 系统timeout 10 防止接口卡死
+              # 先判断仓库是否存在
+              repo_data=$(timeout 10 aliyun cr ListRepo --Namespace "$ALIYUN_NAME_SPACE" --RepoName "$repo_name" 2>/dev/null)
+              if [[ -z "$repo_data" ]]; then
+                echo "【DEBUG】仓库不存在，镜像不存在"
+                set -e
+                return 1
+              fi
+              # 查询所有Tag
               local tag_list=$(timeout 10 aliyun cr ListRepoTag \
                   --Namespace "$ALIYUN_NAME_SPACE" \
                   --RepoName "$repo_name" \
                   --PageSize 100 2>/dev/null | jq -r '.Tags[].Tag')
+              echo "【DEBUG】仓库现有Tag列表：$tag_list"
               echo "$tag_list" | grep -xF "$tag" >/dev/null
               local ret=$?
               set -e
@@ -117,10 +126,15 @@ jobs:
 
               # 清理sha后缀
               image_raw="${image_raw%%@*}"
-              # 拆分镜像名:tag
+              # 拆分镜像名:tag，兜底tag=latest防止空
               image_name_tag=$(echo "$image_raw" | awk -F'/' '{print $NF}')
-              img_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
-              img_tag=$(echo "$image_name_tag" | awk -F':' '{print $2}')
+              if [[ "$image_name_tag" == *":"* ]]; then
+                img_name=$(echo "$image_name_tag" | cut -d: -f1)
+                img_tag=$(echo "$image_name_tag" | cut -d: -f2)
+              else
+                img_name="$image_name_tag"
+                img_tag="latest"
+              fi
 
               # platform前缀处理
               plat_prefix=""
@@ -133,7 +147,6 @@ jobs:
               target_repo="${plat_prefix}${img_name}"
               target_img="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$target_full_name"
 
-              echo "DEBUG 仓库:$target_repo 标签:$img_tag"
               # 判断镜像存在，存在则跳过
               if check_aliyun_image_exist "$target_repo" "$img_tag"; then
                   echo "=============================="
