@@ -110,12 +110,10 @@ jobs:
               img_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
               img_tag=$(echo "$image_name_tag" | awk -F':' '{print $2}')
 
-              # 空命名空间用占位符，避免空数组下标报错
+              # 空命名空间直接留空，不再用占位符，彻底根除__EMPTY__
               local repo_prefix=""
               if [[ -n "$name_space" ]]; then
                 repo_prefix="${name_space}_"
-              else
-                repo_prefix="__EMPTY__"
               fi
               # platform前缀
               local plat_prefix=""
@@ -126,11 +124,20 @@ jobs:
               echo "$plat_prefix $repo_prefix $img_name $img_tag"
           }
 
-          # 【工具函数2】查询镜像是否存在（系统timeout10秒防卡死、jq精准匹配Tag）
+          # 【工具函数2】查询镜像是否存在（优化返回码逻辑，仓库不存在直接返回不存在）
           function check_aliyun_image_exist() {
               local repo_name=$1
               local tag=$2
               set +e
+              # 先查询仓库是否存在，仓库不存在直接返回1（不存在）
+              repo_check=$(timeout 10 aliyun cr ListRepo \
+                  --Namespace "$ALIYUN_NAME_SPACE" \
+                  --RepoName "$repo_name" 2>/dev/null)
+              if [[ -z "$repo_check" ]]; then
+                set -e
+                return 1
+              fi
+              # 仓库存在再查tag列表
               local tag_list=$(timeout 10 aliyun cr ListRepoTag \
                   --Namespace "$ALIYUN_NAME_SPACE" \
                   --RepoName "$repo_name" \
@@ -151,17 +158,12 @@ jobs:
                   continue
               fi
               read plat_prefix repo_prefix img_name img_tag <<< $(parse_image_line "$line")
-              # 占位符还原为空，用于重名判断
-              real_repo_prefix=""
-              if [[ "$repo_prefix" != "__EMPTY__" ]]; then
-                real_repo_prefix="$repo_prefix"
-              fi
               if [[ -n "${temp_map[$img_name]}" ]]; then
-                if [[ "${temp_map[$img_name]}" != "$real_repo_prefix" ]]; then
+                if [[ "${temp_map[$img_name]}" != "$repo_prefix" ]]; then
                   duplicate_images[$img_name]="true"
                 fi
               else
-                temp_map[$img_name]="$real_repo_prefix"
+                temp_map[$img_name]="$repo_prefix"
               fi
           done < images.txt
 
@@ -173,16 +175,13 @@ jobs:
                   continue
               fi
 
-              # 统一解析镜像
+              # 统一解析镜像（无__EMPTY__占位符，repo_prefix空就是空）
               read plat_prefix repo_prefix img_name img_tag <<< $(parse_image_line "$line")
-              # 还原空命名空间占位符
-              real_repo_prefix=""
-              if [[ "$repo_prefix" != "__EMPTY__" ]]; then
-                real_repo_prefix="$repo_prefix"
-              fi
-              target_full_name="${plat_prefix}${real_repo_prefix}${img_name}:${img_tag}"
-              target_repo="${plat_prefix}${real_repo_prefix}${img_name}"
+              target_full_name="${plat_prefix}${repo_prefix}${img_name}:${img_tag}"
+              target_repo="${plat_prefix}${repo_prefix}${img_name}"
 
+              # 打印调试信息，方便核对真实查询仓库名
+              echo "DEBUG: 待查询仓库名: $target_repo , Tag: $img_tag"
               # 判断镜像是否已存在阿里云
               if check_aliyun_image_exist "$target_repo" "$img_tag"; then
                   echo "=============================="
