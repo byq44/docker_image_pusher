@@ -55,14 +55,20 @@ jobs:
       - name: Docker Setup Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 【新增步骤】安装阿里云CLI，自动截取地域配置
+      # 【修复】安装阿里云CLI 稳定二进制包 + 正确截取region
       - name: Install Aliyun CLI
         run: |
-          curl -fsSL https://aliyuncli.alibabacloud.com/install.sh | sudo sh
-          # 自动从仓库域名截取地域
+          # 二进制安装，避免install.sh脚本失败
+          curl -fsSL https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz | tar xz
+          sudo mv aliyun /usr/local/bin/
+          aliyun --version
+
+          # 正确截取地域：cn-hangzhou-registry.aliyuncs.com → cn-hangzhou
           REGISTRY_FULL="$ALIYUN_REGISTRY"
-          ALIYUN_REGION=$(echo "$REGISTRY_FULL" | awk -F'[.-]' '{print $3}')
+          ALIYUN_REGION=$(echo "$REGISTRY_FULL" | cut -d '.' -f1)
           echo "自动识别阿里云地域：$ALIYUN_REGION"
+
+          # 配置AK/SK
           aliyun configure set \
             --access-key-id $ALIYUN_AK \
             --access-key-secret $ALIYUN_SK \
@@ -72,16 +78,19 @@ jobs:
         run: |
           docker login -u $ALIYUN_REGISTRY_USER -p $ALIYUN_REGISTRY_PASSWORD $ALIYUN_REGISTRY
 
-          # 【新增函数】查询阿里云镜像是否存在
+          # 【新增函数】查询阿里云镜像是否存在（内部加set容错，查询失败不中断流程）
           function check_aliyun_image_exist() {
               local repo_name=$1
               local tag=$2
+              set +e
               aliyun cr ListRepoTag \
                   --RepoNamespace "$ALIYUN_NAME_SPACE" \
                   --RepoName "$repo_name" \
                   --PageSize 100 \
                   | grep -q "\"Tag\":\"$tag\""
-              return $?
+              local ret=$?
+              set -e
+              return $ret
           }
 
           # 数据预处理,判断镜像是否重名
