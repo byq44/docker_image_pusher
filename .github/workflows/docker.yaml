@@ -52,41 +52,25 @@ jobs:
       - name: Docker Setup Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ========== 缓存阿里云CLI二进制，避免重复下载 ==========
-      - name: Cache Aliyun CLI Binary
-        uses: actions/cache@v4
-        id: cache-aliyun-cli
+      # 安装jq
+      - name: Install jq
+        run: sudo apt update && sudo apt install -y jq
+
+      # 官方Action一键安装阿里云CLI，无curl下载包，不会404限流
+      - name: Setup Aliyun CLI
+        uses: aliyun/setup-aliyun-cli@v1
         with:
-          # 缓存二进制所在路径
-          path: /usr/local/bin/aliyun
-          # 缓存key，区分系统，固定版本则永久命中
-          key: ${{ runner.os }}-aliyun-cli-v3.3.23
-          restore-keys: |
-            ${{ runner.os }}-aliyun-cli-
+          version: v3.3.23
 
-      # 安装阿里云CLI + jq，国内镜像解决404，缓存命中则跳过下载
-      - name: Install Aliyun CLI & jq
-        if: steps.cache-aliyun-cli.outputs.cache-hit != 'true'
-        run: |
-          sudo apt update && sudo apt install -y jq
-          # 国内镜像加速下载，不会404
-          curl -fsSL https://mirrors.aliyun.com/aliyuncli/aliyun-cli-linux-latest-amd64.tgz -o aliyun.tgz
-          tar -xzf aliyun.tgz
-          sudo mv aliyun /usr/local/bin/
-          aliyun --version || exit 1
-
-      # 配置阿里云CLI地域、实例ID（每次必须执行，配置存在内存，无需缓存）
+      # 提取实例ID、地域并配置AK
       - name: Config Aliyun CLI Env
         run: |
           REGISTRY_FULL="$ALIYUN_REGISTRY"
-          # 自动截取实例ID（域名第一段 crpi-xxx）
           echo "INSTANCE_ID=$(echo "$REGISTRY_FULL" | awk -F'.' '{print $1}')" >> $GITHUB_ENV
-          # 自动截取地域（域名第二段 cn-beijing）
           echo "ALIYUN_REGION=$(echo "$REGISTRY_FULL" | awk -F'.' '{print $2}')" >> $GITHUB_ENV
           echo "自动识别实例ID：${{ env.INSTANCE_ID }}"
           echo "自动识别仓库地域：${{ env.ALIYUN_REGION }}"
 
-          # 配置只读AK/SK
           aliyun configure set \
             --access-key-id $ALIYUN_AK \
             --access-key-secret $ALIYUN_SK \
