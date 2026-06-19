@@ -83,7 +83,7 @@ jobs:
           # 安全登录镜像仓库
           echo "$ALIYUN_REGISTRY_PASSWORD" | docker login "$ALIYUN_REGISTRY" -u "$ALIYUN_REGISTRY_USER" --password-stdin
 
-          # 【工具函数1】解析镜像行，输出三个值 repo_prefix image_name tag
+          # 【工具函数1】解析镜像行，输出四段：plat_prefix repo_prefix img_name img_tag
           function parse_image_line() {
               local line="$1"
               line=$(echo "$line" | xargs) # 去除首尾空格
@@ -110,10 +110,12 @@ jobs:
               img_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
               img_tag=$(echo "$image_name_tag" | awk -F':' '{print $2}')
 
-              # 拼接仓库前缀，空命名空间不加下划线
+              # 空命名空间用占位符，避免空数组下标报错
               local repo_prefix=""
               if [[ -n "$name_space" ]]; then
                 repo_prefix="${name_space}_"
+              else
+                repo_prefix="__EMPTY__"
               fi
               # platform前缀
               local plat_prefix=""
@@ -121,16 +123,14 @@ jobs:
                 plat_prefix="${platform//\//_}_"
               fi
 
-              # 输出三段：plat_prefix repo_prefix img_name img_tag
               echo "$plat_prefix $repo_prefix $img_name $img_tag"
           }
 
-          # 【工具函数2】查询镜像是否存在（修复参数+超时+jq精准匹配）
+          # 【工具函数2】查询镜像是否存在（系统timeout10秒防卡死、jq精准匹配Tag）
           function check_aliyun_image_exist() {
               local repo_name=$1
               local tag=$2
               set +e
-              # 系统timeout 10：10秒无响应直接终止命令
               local tag_list=$(timeout 10 aliyun cr ListRepoTag \
                   --Namespace "$ALIYUN_NAME_SPACE" \
                   --RepoName "$repo_name" \
@@ -145,21 +145,23 @@ jobs:
           declare -A duplicate_images
           declare -A temp_map
           while IFS= read -r line || [ -n "$line" ]; do
-              # 忽略空行、注释
               line=$(echo "$line" | xargs)
               [[ -z "$line" ]] && continue
               if [[ "$line" =~ ^# ]]; then
                   continue
               fi
-              # 调用解析函数
               read plat_prefix repo_prefix img_name img_tag <<< $(parse_image_line "$line")
-              key="${img_name}_${repo_prefix}"
+              # 占位符还原为空，用于重名判断
+              real_repo_prefix=""
+              if [[ "$repo_prefix" != "__EMPTY__" ]]; then
+                real_repo_prefix="$repo_prefix"
+              fi
               if [[ -n "${temp_map[$img_name]}" ]]; then
-                  if [[ "${temp_map[$img_name]}" != "$repo_prefix" ]]; then
-                      duplicate_images[$img_name]="true"
-                  fi
+                if [[ "${temp_map[$img_name]}" != "$real_repo_prefix" ]]; then
+                  duplicate_images[$img_name]="true"
+                fi
               else
-                  temp_map[$img_name]="$repo_prefix"
+                temp_map[$img_name]="$real_repo_prefix"
               fi
           done < images.txt
 
@@ -173,8 +175,13 @@ jobs:
 
               # 统一解析镜像
               read plat_prefix repo_prefix img_name img_tag <<< $(parse_image_line "$line")
-              target_full_name="${plat_prefix}${repo_prefix}${img_name}:${img_tag}"
-              target_repo="${plat_prefix}${repo_prefix}${img_name}"
+              # 还原空命名空间占位符
+              real_repo_prefix=""
+              if [[ "$repo_prefix" != "__EMPTY__" ]]; then
+                real_repo_prefix="$repo_prefix"
+              fi
+              target_full_name="${plat_prefix}${real_repo_prefix}${img_name}:${img_tag}"
+              target_repo="${plat_prefix}${real_repo_prefix}${img_name}"
 
               # 判断镜像是否已存在阿里云
               if check_aliyun_image_exist "$target_repo" "$img_tag"; then
@@ -197,14 +204,15 @@ jobs:
 
               # 打标签
               target_img="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$target_full_name"
-              docker tag "$(echo $line | awk '{print $NF}' | xargs)" "$target_img"
+              src_image=$(echo "$line" | awk '{print $NF}' | xargs)
+              docker tag "$src_image" "$target_img"
 
               # 推送镜像
               docker push "$target_img"
               push_exit=$?
               if [ $push_exit -ne 0 ]; then
                   echo "❌ 镜像【$line】推送失败，跳过当前镜像"
-                  docker rmi "$(echo $line | awk '{print $NF}' | xargs)" "$target_img" || true
+                  docker rmi "$src_image" "$target_img" || true
                   set -e
                   continue
               fi
@@ -216,7 +224,7 @@ jobs:
               echo "=============================================================================="
               df -hT
               echo "=============================================================================="
-              docker rmi "$(echo $line | awk '{print $NF}' | xargs)" "$target_img" || true
+              docker rmi "$src_image" "$target_img" || true
               echo "磁盘空间清理完毕"
               echo "=============================================================================="
               df -hT
