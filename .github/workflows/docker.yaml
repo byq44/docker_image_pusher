@@ -10,7 +10,7 @@ env:
   ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
   ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
   ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
-  # 只读查询AK/SK（绑定 AliyunContainerRegistryReadOnlyAccess）
+  # 只读查询AK/SK 权限：AliyunContainerRegistryReadOnlyAccess
   ALIYUN_AK: "${{ secrets.ALIYUN_AK }}"
   ALIYUN_SK: "${{ secrets.ALIYUN_SK }}"
 
@@ -52,17 +52,46 @@ jobs:
       - name: Docker Setup Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 安装jq
-      - name: Install jq
-        run: sudo apt update && sudo apt install -y jq
-
-      # 官方Action一键安装阿里云CLI，无curl下载包，不会404限流
-      - name: Setup Aliyun CLI
-        uses: aliyun/setup-aliyun-cli@v1
+      # 缓存阿里云CLI二进制，第一次下载后永久复用
+      - name: Cache Aliyun CLI Binary
+        uses: actions/cache@v4
+        id: cache-aliyun-cli
         with:
-          version: v3.3.23
+          path: /usr/local/bin/aliyun
+          key: ${{ runner.os }}-aliyun-cli-v3.3.23
+          restore-keys: |
+            ${{ runner.os }}-aliyun-cli-
 
-      # 提取实例ID、地域并配置AK
+      # 仅缓存未命中时执行下载，双地址+3轮重试防404限流
+      - name: Install Aliyun CLI & jq
+        if: steps.cache-aliyun-cli.outputs.cache-hit != 'true'
+        run: |
+          sudo apt update && sudo apt install -y jq
+          ALIYUN_CLI_VER="v3.3.23"
+          download_urls=(
+            "https://github.com/aliyun/aliyun-cli/releases/download/${ALIYUN_CLI_VER}/aliyun-cli-linux-${ALIYUN_CLI_VER}-amd64.tgz"
+            "https://mirrors.aliyun.com/aliyuncli/aliyun-cli-linux-latest-amd64.tgz"
+          )
+          success=0
+          for i in {1..3}; do
+            for url in "${download_urls[@]}"; do
+              echo "尝试下载地址: $url"
+              curl -fsSL "$url" -o aliyun.tgz && success=1 && break 2
+              echo "当前地址下载失败，等待3秒切换地址重试"
+              sleep 3
+            done
+            echo "第${i}轮全部地址失败，等待5秒后重试"
+            sleep 5
+          done
+          if [ $success -ne 1 ]; then
+            echo "所有下载地址均404/限流，终止任务"
+            exit 1
+          fi
+          tar -xzf aliyun.tgz
+          sudo mv aliyun /usr/local/bin/
+          aliyun --version || exit 1
+
+      # 自动截取实例ID、地域，写入全局环境变量
       - name: Config Aliyun CLI Env
         run: |
           REGISTRY_FULL="$ALIYUN_REGISTRY"
@@ -76,30 +105,29 @@ jobs:
             --access-key-secret $ALIYUN_SK \
             --region "${{ env.ALIYUN_REGION }}"
 
+      # 镜像同步主逻辑
       - name: Sync Images
         run: |
-          # 安全登录镜像仓库
+          # 登录阿里云镜像仓库
           echo "$ALIYUN_REGISTRY_PASSWORD" | docker login "$ALIYUN_REGISTRY" -u "$ALIYUN_REGISTRY_USER" --password-stdin
 
-          # 全局变量：实例ID、命名空间
           INSTANCE_ID="${{ env.INSTANCE_ID }}"
           NAMESPACE="$ALIYUN_NAME_SPACE"
 
-          # 函数：双层校验 仓库存在 + Tag版本存在
+          # 双层校验函数：先查仓库ID，再查Tag版本（兼容2018-12-01接口）
           function check_aliyun_image_exist() {
               local repo_name="$1"
               local target_tag="$2"
               echo "【DEBUG第一层校验】目标仓库:$repo_name，目标版本:$target_tag，实例:$INSTANCE_ID"
               set +e
 
-              # 第一步：ListRepo 查询仓库列表，获取数字RepoId
+              # 第一步：查询仓库列表，获取数字RepoId
               local repo_query_result
               repo_query_result=$(timeout 10 aliyun cr ListRepo \
                   --InstanceId "$INSTANCE_ID" \
                   --Namespace "$NAMESPACE" \
                   --PageNo 1 \
                   --PageSize 100 2>&1)
-              # 匹配仓库名称，提取RepoId
               local target_repo_id
               target_repo_id=$(echo "$repo_query_result" | jq -r ".Repos[] | select(.RepoName==\"$repo_name\") | .RepoId" 2>/dev/null)
 
@@ -111,61 +139,56 @@ jobs:
               fi
               echo "【DEBUG】匹配到仓库数字ID：$target_repo_id"
 
-              # 第二步：ListRepoTag 查询该仓库下所有Tag（必填InstanceId+RepoId）
+              # 第二步：携带InstanceId+RepoId 查询Tag列表
               local tag_query_result
               tag_query_result=$(timeout 10 aliyun cr ListRepoTag \
                   --InstanceId "$INSTANCE_ID" \
                   --RepoId "$target_repo_id" \
                   --PageNo 1 \
                   --PageSize 100 2>&1)
-              # 解析全部Tag列表
               local all_tag_list
               all_tag_list=$(echo "$tag_query_result" | jq -r '.Tags | map(.Tag) | join("\n")' 2>/dev/null || echo "")
               echo "【DEBUG第二层校验】仓库现有全部Tag列表：$all_tag_list"
 
-              # 精确匹配目标Tag
+              # 精确匹配目标版本
               echo "$all_tag_list" | grep -xF "$target_tag" >/dev/null
               local match_result=$?
 
-              # 分支2：Tag不存在，返回1，执行推送
+              # 分支2：仓库存在，Tag不存在，执行推送
               if [[ $match_result -ne 0 ]]; then
                   echo "【DEBUG结果】仓库存在，但版本 $target_tag 不存在，需要推送镜像"
                   set -e
                   return 1
               fi
 
-              # 分支3：仓库+Tag全部存在，返回0，跳过推送
+              # 分支3：仓库+Tag均存在，跳过推送
               echo "【DEBUG结果】仓库 $repo_name:$target_tag 已存在，无需推送"
               set -e
               return 0
           }
 
-          # 循环读取images.txt同步
+          # 循环读取images.txt逐行同步
           while IFS= read -r line || [ -n "$line" ]; do
-              # 去除首尾空格
               line=$(echo "$line" | xargs)
-              # 跳过空行、注释行
               [[ -z "$line" ]] && continue
               [[ "$line" =~ ^# ]] && continue
 
-              # 分离 --platform 参数与镜像地址
               platform=""
               image_raw=""
               arr=($line)
               i=0
               while [[ $i -lt ${#arr[@]} ]]; do
-                  if [[ "${arr[$i]}" == "--platform" ]]; then
-                      platform="${arr[$((i+1))]}"
-                      i=$((i+2))
-                  else
-                      image_raw="${arr[$i]}"
-                      i=$((i+1))
-                  fi
+                if [[ "${arr[$i]}" == "--platform" ]]; then
+                  platform="${arr[$((i+1))]}"
+                  i=$((i+2))
+                else
+                  image_raw="${arr[$i]}"
+                  i=$((i+1))
+                fi
               done
 
-              # 清理sha后缀
+              # 清理sha摘要后缀
               image_raw="${image_raw%%@*}"
-              # 拆分镜像名:tag，兜底tag=latest防止空
               image_name_tag=$(echo "$image_raw" | awk -F'/' '{print $NF}')
               if [[ "$image_name_tag" == *":"* ]]; then
                 img_name=$(echo "$image_name_tag" | cut -d: -f1)
@@ -175,18 +198,17 @@ jobs:
                 img_tag="latest"
               fi
 
-              # platform前缀处理
+              # 多平台前缀处理
               plat_prefix=""
               if [[ -n "$platform" ]]; then
                 plat_prefix="${platform//\//_}_"
               fi
 
-              # 阿里云目标仓库/镜像全名
               target_full_name="${plat_prefix}${img_name}:${img_tag}"
               target_repo="${plat_prefix}${img_name}"
               target_img="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$target_full_name"
 
-              # 判断镜像存在，存在则跳过
+              # 判断镜像是否存在阿里云仓库
               if check_aliyun_image_exist "$target_repo" "$img_tag"; then
                   echo "=============================="
                   echo "镜像 $target_img 已存在，跳过同步"
@@ -196,20 +218,20 @@ jobs:
 
               echo "===== 开始处理镜像：$line ====="
               set +e
-              # 拉取镜像，失败直接跳过当前
+              # 拉取镜像，失败直接跳过当前条目
               docker pull "$line"
               pull_exit=$?
               if [ $pull_exit -ne 0 ]; then
-                  echo "❌ 镜像【$line】拉取失败，跳过当前镜像，继续下一个"
-                  set -e
-                  continue
+                echo "❌ 镜像【$line】拉取失败，跳过当前镜像，继续下一个"
+                set -e
+                continue
               fi
 
               # 打阿里云镜像标签
               src_image=$(echo "$line" | awk '{print $NF}' | xargs)
               docker tag "$src_image" "$target_img"
 
-              # 推送镜像，失败直接跳过当前
+              # 推送镜像，失败直接跳过
               docker push "$target_img"
               push_exit=$?
               if [ $push_exit -ne 0 ]; then
