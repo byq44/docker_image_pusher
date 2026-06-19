@@ -52,18 +52,21 @@ jobs:
       - name: Docker Setup Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 安装阿里云CLI + jq
+      # 安装阿里云CLI + jq，自动截取地域、实例ID
       - name: Install Aliyun CLI & jq
         run: |
           sudo apt update && sudo apt install -y jq
-          curl -fsSL https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz | tar xz
+          curl -fsSL https://aliyuncli.alicdn.com/aliyuncli-linux-latest-amd64.tgz | tar xz
           sudo mv aliyun /usr/local/bin/
           aliyun --version || exit 1
 
-          # 自动截取地域
           REGISTRY_FULL="$ALIYUN_REGISTRY"
+          # 截取实例ID（域名第一段 crpi-xxx）
+          INSTANCE_ID=$(echo "$REGISTRY_FULL" | awk -F'.' '{print $1}')
+          # 截取地域（域名第二段 cn-beijing）
           ALIYUN_REGION=$(echo "$REGISTRY_FULL" | awk -F'.' '{print $2}')
-          echo "识别到仓库地域：$ALIYUN_REGION"
+          echo "自动识别实例ID：$INSTANCE_ID"
+          echo "自动识别仓库地域：$ALIYUN_REGION"
 
           # 配置只读AK/SK
           aliyun configure set \
@@ -76,31 +79,63 @@ jobs:
           # 安全登录镜像仓库
           echo "$ALIYUN_REGISTRY_PASSWORD" | docker login "$ALIYUN_REGISTRY" -u "$ALIYUN_REGISTRY_USER" --password-stdin
 
-          # 函数：判断镜像Tag是否已存在阿里云
+          # 全局变量：实例ID、命名空间
+          INSTANCE_ID=$(echo "$ALIYUN_REGISTRY" | awk -F'.' '{print $1}')
+          NAMESPACE="$ALIYUN_NAME_SPACE"
+
+          # 函数：双层校验 仓库存在 + Tag版本存在
           function check_aliyun_image_exist() {
-              local repo_name=$1
-              local tag=$2
-              echo "【DEBUG查询】仓库:$repo_name 待匹配Tag:$tag"
+              local repo_name="$1"
+              local target_tag="$2"
+              echo "【DEBUG第一层校验】目标仓库:$repo_name，目标版本:$target_tag，实例:$INSTANCE_ID"
               set +e
-              local tag_output
-              # 2>&1 捕获标准错误，识别仓库不存在报错
-              tag_output=$(timeout 10 aliyun cr ListRepoTag \
-                  --Namespace "$ALIYUN_NAME_SPACE" \
-                  --RepoName "$repo_name" \
+
+              # 第一步：ListRepo 查询仓库列表，获取数字RepoId
+              local repo_query_result
+              repo_query_result=$(timeout 10 aliyun cr ListRepo \
+                  --InstanceId "$INSTANCE_ID" \
+                  --Namespace "$NAMESPACE" \
+                  --PageNo 1 \
                   --PageSize 100 2>&1)
-              # 捕获仓库不存在报错
-              if echo "$tag_output" | grep -i "RepositoryNotFound" >/dev/null; then
-                  echo "【DEBUG】仓库不存在，镜像不存在"
+              # 匹配仓库名称，提取RepoId
+              local target_repo_id
+              target_repo_id=$(echo "$repo_query_result" | jq -r ".Repos[] | select(.RepoName==\"$repo_name\") | .RepoId" 2>/dev/null)
+
+              # 分支1：仓库不存在，返回1，执行推送
+              if [[ -z "$target_repo_id" ]]; then
+                  echo "【DEBUG结果】仓库 $repo_name 不存在，需要推送镜像"
                   set -e
                   return 1
               fi
-              # 解析已有Tag列表
-              local tag_list=$(echo "$tag_output" | jq -r '.Tags[].Tag' 2>/dev/null)
-              echo "【DEBUG】仓库现有Tag列表：$tag_list"
-              echo "$tag_list" | grep -xF "$tag" >/dev/null
-              local ret=$?
+              echo "【DEBUG】匹配到仓库数字ID：$target_repo_id"
+
+              # 第二步：ListRepoTag 查询该仓库下所有Tag（必填InstanceId+RepoId）
+              local tag_query_result
+              tag_query_result=$(timeout 10 aliyun cr ListRepoTag \
+                  --InstanceId "$INSTANCE_ID" \
+                  --RepoId "$target_repo_id" \
+                  --PageNo 1 \
+                  --PageSize 100 2>&1)
+              # 解析全部Tag列表
+              local all_tag_list
+              all_tag_list=$(echo "$tag_query_result" | jq -r '.Tags | map(.Tag) | join("\n")' 2>/dev/null || echo "")
+              echo "【DEBUG第二层校验】仓库现有全部Tag列表：$all_tag_list"
+
+              # 精确匹配目标Tag
+              echo "$all_tag_list" | grep -xF "$target_tag" >/dev/null
+              local match_result=$?
+
+              # 分支2：Tag不存在，返回1，执行推送
+              if [[ $match_result -ne 0 ]]; then
+                  echo "【DEBUG结果】仓库存在，但版本 $target_tag 不存在，需要推送镜像"
+                  set -e
+                  return 1
+              fi
+
+              # 分支3：仓库+Tag全部存在，返回0，跳过推送
+              echo "【DEBUG结果】仓库 $repo_name:$target_tag 已存在，无需推送"
               set -e
-              return $ret
+              return 0
           }
 
           # 循环读取images.txt同步
