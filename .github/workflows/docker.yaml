@@ -62,8 +62,8 @@ jobs:
 
           # 自动截取地域
           REGISTRY_FULL="$ALIYUN_REGISTRY"
-          ALIYUN_REGION=$(echo "$REGISTRY_FULL" | cut -d '.' -f1)
-          echo "自动识别阿里云地域：$ALIYUN_REGION"
+          ALIYUN_REGION=$(echo "$REGISTRY_FULL" | awk -F'.' '{print $2}')
+          echo "识别到仓库地域：$ALIYUN_REGION"
 
           # 配置只读AK/SK
           aliyun configure set \
