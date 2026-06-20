@@ -1,1 +1,1 @@
-bitnamicharts/kafka
+bitnamicharts/kafka:32.4.3
